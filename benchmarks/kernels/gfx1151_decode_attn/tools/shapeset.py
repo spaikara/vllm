@@ -11,8 +11,13 @@ a pass ends up measuring a different set than the one it reports.
 
 import argparse
 import csv
+import os
 from pathlib import Path
 from typing import NamedTuple
+
+# The tools measure variants outside variants.def -- every point a search
+# visits -- so they JIT-build all of them rather than use _rocm_C's.
+os.environ.setdefault("VLLM_RDNA35_ATTN_JIT", "1")
 
 _SHAPES = Path(__file__).resolve().parent / "shapes.csv"
 

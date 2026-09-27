@@ -25,7 +25,11 @@
 //   O^T[d][row]  += V[key][d] . P[row][key]      A = V^T,    B = P^T
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstring>
+
+#include "rdna35_attn/launch.h"
 
 #ifndef RDNA35_BODY
   #ifndef HEAD_DIM
@@ -74,8 +78,10 @@
     #define NW 8
   #endif
   // Waves sharing one key tile, each owning 1/DSPL of the head dim.  Keeps a
-  // wave's accumulator, K and V slice within budget at large D.
-  #ifndef DSPL
+  // wave's accumulator, K and V slice within budget at large D.  0, like
+  // leaving it undefined, keeps this rule.
+  #if !defined(DSPL) || DSPL == 0
+    #undef DSPL
     #define DSPL (HEAD_DIM >= 256 ? HEAD_DIM / 128 : 1)
   #endif
   // Waves sharing one key tile, each carrying 1/RSPL of the workgroup's row
@@ -347,8 +353,11 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     Batch bs
   #endif
 ) {
+  // _rocm_C is built for every gfx11 target; the code is gfx1151's alone, and
+  // the registry offers the variants on gfx1151 alone.
+  #if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx1151__)
   __shared__ __attribute__((aligned(16))) char lds[decomp::kLds];
-  #if BATCH
+    #if BATCH
   const int b = blockIdx.y;
   constexpr int kTok = MAXM * NUM_Q_HEADS * HEAD_DIM;
   q += (size_t)b * kTok;
@@ -359,22 +368,23 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   p_l += (size_t)b * bs.ml_stride;
   p_cnt += (size_t)b * bs.cnt_stride;
   seq_lens += b;
-  #endif
+    #endif
   // S and the first page indices go out together: neither waits for the
   // other.  Every KV address depends on the page table.
   const int S = __builtin_amdgcn_readfirstlane(*seq_lens);
   const int pages = decomp::first_pages(bt, bt_width);
-  #if BATCH
+    #if BATCH
   // A CUDA-graph batch padded past its real sequences: S = 0, nothing to
   // read or write.  Only in batch builds: waiting for S before the body's
   // first loads costs 1-3 % at one sequence.
   if (S <= 0) return;
-  #endif
+    #endif
   decomp::body<OutT>(q, kv, bt, p_acc, p_m, p_l, p_cnt, out, S, pages, bt_width,
                      scale, coop, lds);
+  #endif
 }
 
-  #ifndef RDNA35_TORCH_EXT
+  #if !defined(RDNA35_TORCH_EXT) && !defined(RDNA35_VLLM)
 // Instantiated for ISA inspection when built without the torch op.
 template __global__ void decode_attn<elem_t>(const elem_t*, const elem_t*,
                                              const int*, float*, float*, float*,
@@ -386,6 +396,63 @@ template __global__ void decode_attn<elem_t>(const elem_t*, const elem_t*,
     #endif
 );
   #else
+// One call, arguments already checked: by decode_attn_op below in a JIT
+// build, by the registry (rdna35_attn/registry.hip) in _rocm_C's.
+// Static: JIT builds of different variants share a process, and a global
+// symbol would let one variant's op resolve to another's launch.
+static void launch(const rdna35::LaunchArgs& a) {
+  // Row group fastest, then kv head, then segment: the row groups of one kv
+  // head read the same KV and are dispatched side by side to share it in L2.
+  dim3 grid(decomp::kGrid, a.nseq), block(BLOCK);
+  static const int resident = [&] {
+    if (!decomp::kSharedMerge) return 0;
+    int dev, wgps, per = 0;
+    (void)hipGetDevice(&dev);
+    (void)hipDeviceGetAttribute(&wgps, hipDeviceAttributeMultiprocessorCount,
+                                dev);
+    (void)hipOccupancyMaxActiveBlocksPerMultiprocessor(
+        &per, decode_attn<elem_t>, BLOCK, 0);
+    // The runtime assumes 64 KiB of LDS where a gfx1151 WGP has 128, and
+    // reports one workgroup per WGP for anything over 32 KiB.  Count what
+    // fits, rounding every way down: 1536 VGPRs per SIMD in blocks of 24,
+    // and no workgroup spanning the WGP's two CUs.
+    hipFuncAttributes fa;
+    hipDeviceProp_t prop;
+    if (hipFuncGetAttributes(&fa, reinterpret_cast<const void*>(
+                                      decode_attn<elem_t>)) == hipSuccess &&
+        hipGetDeviceProperties(&prop, dev) == hipSuccess &&
+        strstr(prop.gcnArchName, "gfx1151")) {
+      const int wps = std::min(16, 1536 / ((fa.numRegs + 23) / 24 * 24));
+      const int by_waves = 2 * (2 * wps / (BLOCK / WAVE));
+      const int by_lds =
+          fa.sharedSizeBytes ? 128 * 1024 / (int)fa.sharedSizeBytes : by_waves;
+      per = std::max(per, std::min(by_waves, by_lds));
+    }
+    return per * wgps;
+  }();
+  // The shared merge waits across workgroups: only when all of them fit.
+  int coop = (int)(resident >= (int)(grid.x * grid.y));
+    #if BATCH
+  // Segments per sequence, capped so the batch lands near BTARGET
+  // workgroups (the WMMA body reads it from coop's upper bits).
+  const int groups = decomp::kGrid / NSEG;
+  coop |= std::max(1, (BTARGET + a.nseq * groups - 1) / (a.nseq * groups)) << 1;
+  const Batch bs{a.bt_stride, a.acc_stride, a.ml_stride, a.cnt_stride};
+    #endif
+  hipLaunchKernelGGL(decode_attn<elem_t>, grid, block, 0, a.stream,
+                     static_cast<const elem_t*>(a.q),
+                     static_cast<const elem_t*>(a.kv), a.bt, a.acc, a.m, a.l,
+                     a.cnt, static_cast<elem_t*>(a.out), a.seq_lens, a.bt_width,
+                     a.scale, coop
+    #if BATCH
+                     ,
+                     bs
+    #endif
+  );
+}
+  #endif
+
+  #ifdef RDNA35_TORCH_EXT
     #include <ATen/cuda/CUDAContext.h>
     #include <c10/cuda/CUDAGuard.h>
     #include <torch/extension.h>
@@ -423,10 +490,6 @@ void decode_attn_op(torch::Tensor& q, torch::Tensor& kv_cache,
               "scratch holds fewer sequences than the ", nseq, " launched");
   TORCH_CHECK(BATCH || nseq == 1, "one-sequence build launched for ", nseq,
               " sequences");
-  const Batch bs{block_table.dim() == 2 ? (int)block_table.stride(0) : 0,
-                 batched ? (int)acc.stride(0) : 0,
-                 batched ? (int)m.stride(0) : 0,
-                 batched ? (int)cnt.stride(0) : 0};
   TORCH_CHECK(q.size(1) == NUM_Q_HEADS && q.size(2) == HEAD_DIM,
               "q shape does not match the compiled variant");
   // The loads reinterpret every tensor as the element type the variant was
@@ -438,58 +501,14 @@ void decode_attn_op(torch::Tensor& q, torch::Tensor& kv_cache,
               "kernel built for ", dtype, ", got q=", q.scalar_type(),
               " kv_cache=", kv_cache.scalar_type(), " out=", out.scalar_type());
   const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  // Row group fastest, then kv head, then segment: the row groups of one kv
-  // head read the same KV and are dispatched side by side to share it in L2.
-  dim3 grid(decomp::kGrid, nseq), block(BLOCK);
-  static const int resident = [&] {
-    if (!decomp::kSharedMerge) return 0;
-    int dev, wgps, per = 0;
-    (void)hipGetDevice(&dev);
-    (void)hipDeviceGetAttribute(&wgps, hipDeviceAttributeMultiprocessorCount,
-                                dev);
-    (void)hipOccupancyMaxActiveBlocksPerMultiprocessor(
-        &per, decode_attn<elem_t>, BLOCK, 0);
-    // The runtime assumes 64 KiB of LDS where a gfx1151 WGP has 128, and
-    // reports one workgroup per WGP for anything over 32 KiB.  Count what
-    // fits, rounding every way down: 1536 VGPRs per SIMD in blocks of 24,
-    // and no workgroup spanning the WGP's two CUs.
-    hipFuncAttributes fa;
-    hipDeviceProp_t prop;
-    if (hipFuncGetAttributes(&fa, reinterpret_cast<const void*>(
-                                      decode_attn<elem_t>)) == hipSuccess &&
-        hipGetDeviceProperties(&prop, dev) == hipSuccess &&
-        strstr(prop.gcnArchName, "gfx1151")) {
-      const int wps = std::min(16, 1536 / ((fa.numRegs + 23) / 24 * 24));
-      const int by_waves = 2 * (2 * wps / (BLOCK / WAVE));
-      const int by_lds =
-          fa.sharedSizeBytes ? 128 * 1024 / (int)fa.sharedSizeBytes : by_waves;
-      per = std::max(per, std::min(by_waves, by_lds));
-    }
-    return per * wgps;
-  }();
-  // The shared merge waits across workgroups: only when all of them fit.
-  int coop = (int)(resident >= (int)(grid.x * grid.y));
-    #if BATCH
-  // Segments per sequence, capped so the batch lands near BTARGET
-  // workgroups (the WMMA body reads it from coop's upper bits).
-  const int groups = decomp::kGrid / NSEG;
-  coop |= std::max(1, (BTARGET + nseq * groups - 1) / (nseq * groups)) << 1;
-    #endif
-  hipLaunchKernelGGL(
-      decode_attn<elem_t>, grid, block, 0, stream,
-      reinterpret_cast<const elem_t*>(q.data_ptr()),
-      reinterpret_cast<const elem_t*>(kv_cache.data_ptr()),
-      block_table.data_ptr<int>(), acc.data_ptr<float>(), m.data_ptr<float>(),
-      l.data_ptr<float>(), cnt.data_ptr<int>(),
-      reinterpret_cast<elem_t*>(out.data_ptr()), seq_lens.data_ptr<int>(),
-      (int)block_table.size(-1), (float)scale, coop
-    #if BATCH
-      ,
-      bs
-    #endif
-  );
-  (void)bs;
+  launch({q.data_ptr(), kv_cache.data_ptr(), block_table.data_ptr<int>(),
+          acc.data_ptr<float>(), m.data_ptr<float>(), l.data_ptr<float>(),
+          cnt.data_ptr<int>(), out.data_ptr(), seq_lens.data_ptr<int>(),
+          (int)block_table.size(-1),
+          block_table.dim() == 2 ? (int)block_table.stride(0) : 0,
+          batched ? (int)acc.stride(0) : 0, batched ? (int)m.stride(0) : 0,
+          batched ? (int)cnt.stride(0) : 0, nseq, (float)scale,
+          at::cuda::getCurrentCUDAStream()});
 }
 
     #if TIMING
@@ -506,6 +525,38 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, mod) {
   mod.def("timings", &timings);
     #endif
 }
+  #endif
+
+  #ifdef RDNA35_VLLM
+    // _rocm_C builds many variants into one translation unit, each in a
+    // namespace of its own (rdna35_attn/instance.h), so the next one must
+    // start from none of this one's definitions.  The body undefines its own.
+    #undef RDNA35_BODY
+    #undef M_NSEG
+    #undef M_RG
+    #undef M_MINB
+    #undef M_DSPL
+    #undef M_RSPL
+    #undef M_NW
+    #undef M_PF
+    #undef M_DOT
+    #undef M_BFLY
+    #undef M_GT
+    #undef WAVE
+    #undef BLOCK
+    #undef GQA
+    #undef ROWS
+    #undef NCHUNK
+    #undef KV_ROW
+    #undef PAGE_ELEMS
+    #undef KEY_STRIDE
+    #undef LOG2E
+    #undef QPAD
+    #undef PADM
+    #undef MBUDGET
+    #undef TS
+    #undef TS_WG0
+    #undef DSPL
   #endif
 
 #else

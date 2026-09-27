@@ -285,6 +285,64 @@ def _knobs_for(
     return knobs
 
 
+def _variant_for(
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    max_m: int,
+    block_size: int,
+    layout: int,
+    window: int,
+    dtype: torch.dtype,
+    batch: bool,
+) -> KernelVariant:
+    """The kernel build that serves one call."""
+    return KernelVariant(
+        **_knobs_for(num_q_heads, num_kv_heads, head_size, max_m, window, dtype, batch),
+        head_size=head_size,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        max_m=max_m,
+        block_size=block_size,
+        layout=layout,
+        dtype=dtype,
+        window=window,
+        batch=int(batch),
+    )
+
+
+# Page sizes _rocm_C carries kernels for, 16 everywhere plus what vLLM gives
+# these layers when it evens out page sizes across a model's layers -- two
+# head sizes in gemma-4, the GDN state in Qwen3.5/3.6 -- measured per model.
+# Any other page size is served by Triton, which at these sizes is 2.5-6.5x
+# slower than the kernel on the bs=16 knobs.
+_BUILT_BLOCK_SIZES: dict[tuple[int, int, int, int], tuple[int, ...]] = {
+    (8, 1, 256, 512): (16, 32),  # gemma-4-E2B sliding layers
+    (8, 2, 256, 512): (16, 32),  # gemma-4-E4B sliding layers
+    (16, 2, 512, 0): (16, 32),  # gemma-4-26B-A4B full layers
+    (32, 4, 512, 0): (16, 32),  # gemma-4-31B full layers
+    (8, 2, 256, 0): (16, 544),  # Qwen3.5-0.8B, -2B
+    (16, 4, 256, 0): (16, 528),  # Qwen3.5-9B
+    (16, 2, 256, 0): (16, 1056),  # Qwen3.5-35B-A3B, Qwen3.6-35B-A3B
+    (24, 4, 256, 0): (16, 784),  # Qwen3.6-27B
+}
+
+
+def built_variants() -> list[KernelVariant]:
+    """Every variant built into _rocm_C (variants.def): each configuration
+    of the tables at every query length the kernel serves, in both dtypes, for
+    one sequence and for a batch, on the HND cache the backend requires."""
+    configs = {(*k[:3], 0) for k in _TUNED} | {(*k[:3], k[4]) for k in _TUNED_SWA}
+    return [
+        _variant_for(hq, hkv, d, m, bs, 1, window, dtype, batch)
+        for hq, hkv, d, window in sorted(configs)
+        for m in range(1, _MAX_M + 1)
+        for dtype in (torch.float16, torch.bfloat16)
+        for batch in (False, True)
+        for bs in _BUILT_BLOCK_SIZES.get((hq, hkv, d, window), (16,))
+    ]
+
+
 # The JIT-compiled module plus the scratch buffers sized for it.  The module is
 # a pybind extension built at runtime, so it has no static type.
 _Built = tuple[Any, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]
@@ -391,14 +449,12 @@ class Rdna35HipAttentionImpl(TritonAttentionImpl):
         self._cap = 0
 
     def _reject(self, reason: str) -> None:
-        """Record why this shape falls back.
-
-        Warning rather than info: callers select this backend to exercise the
-        HIP kernel, so falling back is something they need to see.
-        """
+        """Record why this shape falls back.  Info, not a warning: as gfx1151's
+        default backend it falls back in normal operation (prefills, head
+        sizes the kernel does not build)."""
         if self._rejected != reason:
             self._rejected = reason
-            logger.warning_once(
+            logger.info_once(
                 "RDNA35_HIP_ATTN falling back to Triton: %s", reason, scope="local"
             )
 
@@ -475,25 +531,16 @@ class Rdna35HipAttentionImpl(TritonAttentionImpl):
         # Logical KV cache order is (num_blocks, num_kv_heads, block_size, 2*hs).
         q = kwargs["q"]
         block_size = kv_cache.shape[2]
-        variant = KernelVariant(
-            **_knobs_for(
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_size,
-                max_m,
-                win,
-                dtype,
-                nseq > 1,
-            ),
-            head_size=self.head_size,
-            num_q_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
-            max_m=max_m,
-            block_size=block_size,
-            layout=0 if kv_cache.stride(1) < kv_cache.stride(2) else 1,
-            dtype=dtype,
-            window=win,
-            batch=int(nseq > 1),
+        variant = _variant_for(
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_size,
+            max_m,
+            block_size,
+            0 if kv_cache.stride(1) < kv_cache.stride(2) else 1,
+            win,
+            dtype,
+            nseq > 1,
         )
         expected = expected_kv_cache_strides(variant)
         actual = (kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2))
@@ -623,3 +670,13 @@ class Rdna35HipAttentionImpl(TritonAttentionImpl):
             return
         self.kernel_calls += 1
         self._launch(built, kv_cache, kwargs)
+
+
+if __name__ == "__main__":
+    from vllm.v1.attention.ops.rdna35_hip_decode import (
+        VARIANTS_DEF,
+        write_variants_def,
+    )
+
+    write_variants_def(built_variants(), VARIANTS_DEF)
+    print(f"wrote {VARIANTS_DEF}")

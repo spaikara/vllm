@@ -73,8 +73,18 @@ def _skip_unless_gfx1151():
         pytest.skip("kernel is built for gfx1151")
 
 
+@pytest.fixture(scope="session")
+def _jit():
+    """The kernel tests build variants of their own -- layouts, segment
+    counts, a mutated kernel -- which only the JIT loader does.  The tests of
+    the variants built into _rocm_C turn it back off."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("VLLM_RDNA35_ATTN_JIT", "1")
+        yield
+
+
 @pytest.fixture(scope="session", autouse=True)
-def _build_variants():
+def _build_variants(_jit):
     """Build the variants this module needs before any test runs.
 
     They are independent builds of ~19.6 s each, almost all of it torch's
@@ -172,26 +182,28 @@ def _paged_inputs(
     hq: int = HQ,
     hkv: int = HKV,
     hd: int = HEAD_DIM,
+    m: int = M,
+    bs: int = BLOCK_SIZE,
 ):
     """Build a KV cache whose physical order matches the layout, then present
     it in the logical (num_blocks, num_kv_heads, block_size, 2*hs) order the
-    backend passes down."""
+    backend passes down.  The last page may be partly filled."""
     torch.manual_seed(seed)
     dev = torch.device("cuda")
-    num_blocks = seq_len // BLOCK_SIZE
+    num_blocks = -(-seq_len // bs)
     if layout == 0:  # NHD
-        kv = torch.randn(num_blocks, BLOCK_SIZE, hkv, 2 * hd, device=dev, dtype=dtype)
+        kv = torch.randn(num_blocks, bs, hkv, 2 * hd, device=dev, dtype=dtype)
         kv = kv.transpose(1, 2)
     else:  # HND
-        kv = torch.randn(num_blocks, hkv, BLOCK_SIZE, 2 * hd, device=dev, dtype=dtype)
+        kv = torch.randn(num_blocks, hkv, bs, 2 * hd, device=dev, dtype=dtype)
     kv = kv * 0.5
-    q = torch.randn(M, hq, hd, device=dev, dtype=dtype) * 0.5
+    q = torch.randn(m, hq, hd, device=dev, dtype=dtype) * 0.5
     return q, kv, torch.arange(num_blocks, device=dev, dtype=torch.int32)
 
 
 def _reference(q, kv, seq_len, window=0):
-    hq, hkv, hd = q.shape[1], kv.shape[1], q.shape[2]
-    flat = kv.transpose(1, 2).reshape(seq_len, hkv, 2 * hd)
+    m, hq, hkv, hd = q.shape[0], q.shape[1], kv.shape[1], q.shape[2]
+    flat = kv.transpose(1, 2).reshape(-1, hkv, 2 * hd)[:seq_len]
     k, v = flat[..., :hd], flat[..., hd:]
     gqa = hq // hkv
     qf = q.float().permute(1, 0, 2)
@@ -199,11 +211,11 @@ def _reference(q, kv, seq_len, window=0):
     vf = v.float().permute(1, 0, 2).repeat_interleave(gqa, 0)
     scores = torch.bmm(qf, kf.transpose(1, 2)) * (hd**-0.5)
     pos = torch.arange(seq_len, device=q.device).view(1, seq_len)
-    lim = (seq_len - M + torch.arange(M, device=q.device)).view(M, 1)
+    lim = (seq_len - m + torch.arange(m, device=q.device)).view(m, 1)
     masked = pos > lim
     if window:
         masked |= pos < lim - (window - 1)
-    scores = scores.masked_fill(masked.view(1, M, seq_len), float("-inf"))
+    scores = scores.masked_fill(masked.view(1, m, seq_len), float("-inf"))
     return torch.bmm(torch.softmax(scores, -1), vf).permute(1, 0, 2)
 
 
@@ -384,12 +396,22 @@ def test_batch_of_sequences(name, dtype):
     _skip_unless_gfx1151()
     shape = dict(BATCHED[name])
     nseg = shape.pop("nseg")
-    dims = {k: v for k, v in shape.items() if k in ("hq", "hkv", "hd")}
-    window = shape.get("window", 0)
-    lens = [1008, 48, 0, 2016]
-    width = max(lens) // BLOCK_SIZE + 1
+    _check_batch(
+        _variant(1, 0, nseg, dtype=dtype, batch=1, **shape), [1008, 48, 0, 2016]
+    )
+
+
+def _check_batch(variant, lens):
+    """Launch a batch build over sequences of these lengths and check each
+    against its own reference, twice, a padded one (S=0) left unwritten."""
+    v = variant
+    dims = dict(
+        hq=v.num_q_heads, hkv=v.num_kv_heads, hd=v.head_size, m=v.max_m, bs=v.block_size
+    )
+    width = max(lens) // v.block_size + 1
     parts = [
-        _paged_inputs(max(s, 16), 1, dtype, seed=i, **dims) for i, s in enumerate(lens)
+        _paged_inputs(max(s, 16), 1, v.dtype, seed=i, **dims)
+        for i, s in enumerate(lens)
     ]
     kv = torch.cat([p[1] for p in parts])
     first = torch.tensor([0] + [p[1].shape[0] for p in parts]).cumsum(0)
@@ -397,21 +419,20 @@ def test_batch_of_sequences(name, dtype):
     for i, p in enumerate(parts):
         bt[i, : p[1].shape[0]] = p[2] + int(first[i])
     q = torch.cat([p[0] for p in parts])
-    variant = _variant(1, 0, nseg, dtype=dtype, batch=1, **shape)
-    module = rdna35.load(variant)
-    scratch = rdna35.make_scratch(variant, q.device, max_seqs=len(lens))
+    module = rdna35.load(v)
+    scratch = rdna35.make_scratch(v, q.device, max_seqs=len(lens))
     seq_lens = torch.tensor(lens, device=q.device, dtype=torch.int32)
     out = torch.full_like(q, 7.0)
     for _ in range(2):
         module.decode_attn(q, kv, bt, out, *scratch, seq_lens, q.shape[2] ** -0.5)
     torch.accelerator.synchronize()
     for i, s in enumerate(lens):
-        rows = out[i * M : (i + 1) * M].float()
+        rows = out[i * v.max_m : (i + 1) * v.max_m].float()
         if s == 0:
-            assert (rows == 7.0).all(), "a padded sequence must not be written"
+            assert (rows == 7.0).all(), f"{v.name}: a padded sequence was written"
             continue
-        ref = _reference(parts[i][0], parts[i][1], s, window)
-        assert _max_rel(rows, ref) <= TOL[dtype], f"sequence {i}, S={s}"
+        ref = _reference(parts[i][0], parts[i][1], s, v.window)
+        assert _max_rel(rows, ref) <= TOL[v.dtype], f"{v.name}: sequence {i}, S={s}"
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -501,3 +522,84 @@ def test_non_decode_batches_fall_back_to_triton(nseq, tokens, max_q, reason):
     )
     assert not fits
     assert reason in impl._rejected
+
+
+def _built_variants():
+    from vllm.v1.attention.backends.rdna35_hip_attn import built_variants
+
+    return built_variants()
+
+
+def test_variants_def_matches_the_tables(tmp_path):
+    """variants.def is what _rocm_C is built from.  A table row changed without
+    regenerating it would leave the backend asking for a variant that was
+    never built, and every call of that shape silently on Triton."""
+    path = tmp_path / "variants.def"
+    rdna35.write_variants_def(_built_variants(), path)
+    assert path.read_text() == rdna35.VARIANTS_DEF.read_text(), (
+        "variants.def is stale: python -m vllm.v1.attention.backends.rdna35_hip_attn"
+    )
+
+
+def test_every_listed_variant_is_built_in(monkeypatch):
+    _skip_unless_gfx1151()
+    monkeypatch.delenv("VLLM_RDNA35_ATTN_JIT")
+    missing = [v.name for v in _built_variants() if rdna35._builtin_index(v) < 0]
+    assert not missing, f"{len(missing)} variants not in _rocm_C, e.g. {missing[0]}"
+
+
+@pytest.mark.parametrize(
+    "group", sorted({rdna35.variant_group(v) for v in _built_variants()})
+)
+def test_built_in_variants_match_reference(group, monkeypatch):
+    """Every variant built into _rocm_C, launched through the registry: one
+    sequence past a partial tile, and a batch with a padded sequence.  Windows
+    run past the window, so that it masks; large pages end partly filled."""
+    _skip_unless_gfx1151()
+    monkeypatch.delenv("VLLM_RDNA35_ATTN_JIT")
+    for v in _built_variants():
+        if rdna35.variant_group(v) != group:
+            continue
+        s = max(1024, v.window + 64, v.block_size + 1000)
+        if v.batch:
+            _check_batch(v, [s, 48, 0])
+            continue
+        dims = dict(
+            hq=v.num_q_heads,
+            hkv=v.num_kv_heads,
+            hd=v.head_size,
+            m=v.max_m,
+            bs=v.block_size,
+        )
+        q, kv, block_table = _paged_inputs(s, 1, v.dtype, **dims)
+        module = rdna35.load(v)
+        assert isinstance(module, rdna35._Builtin), v.name
+        out = torch.empty_like(q)
+        module.decode_attn(
+            q,
+            kv,
+            block_table,
+            out,
+            *rdna35.make_scratch(v, q.device),
+            torch.tensor([s], device=q.device, dtype=torch.int32),
+            q.shape[2] ** -0.5,
+        )
+        torch.accelerator.synchronize()
+        ref = _reference(q, kv, s, v.window)
+        assert _max_rel(out.float(), ref) <= TOL[v.dtype], v.name
+
+
+@pytest.mark.parametrize("gfx1151", [True, False])
+def test_default_backend_only_on_gfx1151(gfx1151, monkeypatch):
+    """The default on gfx1151, ahead of Triton, which serves what it does not;
+    absent on the other RDNA targets, where its kernels carry no code."""
+    import vllm.platforms.rocm as rocm
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum as B
+
+    monkeypatch.setattr(rocm, "on_gfx1x", lambda: True)
+    monkeypatch.setattr(rocm, "on_gfx1151", lambda: gfx1151)
+    order = rocm._get_backend_priorities(use_mla=False, use_sparse=False)
+    if gfx1151:
+        assert order.index(B.RDNA35_HIP_ATTN) < order.index(B.TRITON_ATTN)
+    else:
+        assert B.RDNA35_HIP_ATTN not in order
