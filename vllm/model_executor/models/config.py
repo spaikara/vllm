@@ -248,11 +248,23 @@ class Gemma4Config(VerifyAndUpdateConfig):
                     head_dims,
                 )
         elif vllm_config.attention_config.backend is None:
-            vllm_config.attention_config.backend = AttentionBackendEnum.TRITON_ATTN
+            from vllm.platforms import current_platform
+
+            # One backend for every layer.  On gfx1151 that is RDNA35_HIP_ATTN:
+            # TRITON_ATTN with decode on the HIP kernel, which is built for
+            # both head sizes.
+            backend = AttentionBackendEnum.TRITON_ATTN
+            if current_platform.is_rocm():
+                from vllm.platforms.rocm import on_gfx1151
+
+                if on_gfx1151():
+                    backend = AttentionBackendEnum.RDNA35_HIP_ATTN
+            vllm_config.attention_config.backend = backend
             logger.info(
                 "Gemma4 model has heterogeneous head dimensions "
-                "%s. FA4 not available, forcing TRITON_ATTN backend.",
+                "%s. FA4 not available, forcing %s backend.",
                 head_dims,
+                backend.name,
             )
 
 
