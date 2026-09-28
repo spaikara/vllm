@@ -1949,3 +1949,38 @@ geomean, median 92.7 % of roof; 44 of 104 mixed cells split, at 1.62x.
 Windows: 36 decode cells at 1.50x, median 93.1 %; 20 of 24 mixed split, at
 1.18x.  No cell under 0.97x, and those under 1.00x are Triton against
 Triton (eager noise) or within 2 % near roof.
+
+## 034 — Built into _rocm_C, default on gfx1151, re-tuned at M = 1..4
+
+**Status:** landed, `6f43147089`, `66a67992e1`, `173259ce54`; golden
+`golden/fp16.md`, `golden/bf16.md`.
+
+The variants the tables name are compiled with vLLM into `_rocm_C`
+(`csrc/rocm/rdna35_attn/`): `variants.def` is one X-macro list written from
+the tables (`python -m vllm.v1.attention.backends.rdna35_hip_attn`),
+`cmake/rdna35_attn.cmake` makes one unit per (configuration, dtype), and the
+backend no longer JIT-builds -- a variant missing from the list falls back to
+Triton.  The tools here still JIT-build (`VLLM_RDNA35_ATTN_JIT`, set by
+`shapeset.py`); the device ISA of both builds is identical.  1280 variants:
+M = 1..8, both dtypes, one sequence and batched, block size 16 plus the page
+sizes vLLM gives gemma-4 (32) and the Qwen3.5/3.6 hybrids (528, 544, 784,
+1056), where Triton is 2.0-6.5x slower than the kernel on the bs = 16 knobs.
+
+RDNA35_HIP_ATTN is gfx1151's default backend, and what Gemma4's
+heterogeneous head sizes force there instead of TRITON_ATTN.
+
+`tune.py` on every configuration at M = 1..4, full and windowed, fp16,
+contexts 128, 256, 16384, 32768; each proposed row timed against the previous
+knobs in an interleaved A/B over the seven matrix contexts (three rounds,
+medians), landed when its geomean won with no cell below 0.975x.  128 rows:
+60 landed, 34 matched the old row, 34 lost.
+
+| M | landed | geomean of the gains | best |
+| --- | --- | --- | --- |
+| 1 | 8 | 1.012x | 1.041x (14/2/64) |
+| 2 | 23 | 1.046x | 1.172x (8/2/256 w512) |
+| 3 | 18 | 1.057x | 1.263x (16/1/512) |
+| 4 | 11 | 1.020x | 1.053x |
+
+bf16 is not tuned apart: it runs the fp16 rows, except where a row is the dot
+decomposition (021), where `_TUNED_BF16` keeps a WMMA row.

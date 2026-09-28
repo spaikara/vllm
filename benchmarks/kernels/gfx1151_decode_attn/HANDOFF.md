@@ -11,9 +11,9 @@ bf16, **HND** (see §5.1), one sequence unless it says batch (§4.6,
 | file | what it is |
 | --- | --- |
 | this one | state, open work, traps |
-| `OPTIMIZATIONS.md` | one entry per optimisation landed **or rejected**, with the numbers. 001-008 describe the previous (dot) kernel; 009 is the rewrite, 010-033 the commits below |
+| `OPTIMIZATIONS.md` | one entry per optimisation landed **or rejected**, with the numbers. 001-008 describe the previous (dot) kernel; 009 is the rewrite, 010-034 the commits below |
 | `reference/` | the previous per-q-head dot kernel and its D=512 golden, kept for comparison only |
-| `golden/` | best measured result per head size for the WMMA kernel, with each configuration's ceiling; replace only when beaten. `bf16.md` is the same for bf16, `swa.md` for the sliding-window configurations, `batch.md` for batches of sequences and mixed batches |
+| `golden/` | best measured result per configuration, with its ceiling; replace only when beaten. `fp16.md` and `bf16.md`: every configuration at M = 1..4, full attention and sliding window, one pass each; `batch.md` for batches of sequences and mixed batches |
 | `reports/` | the original investigation record, about the dot kernel. Its `%roof` numbers are superseded |
 
 ---
@@ -63,6 +63,11 @@ Commits on top of it, 2026-09-25:
 | `e2c7a309e1` (033) | `tools/batch.py`, `golden/batch.md`; two more limits on the split |
 
 ### The performance picture
+
+**Current:** `golden/fp16.md` and `golden/bf16.md` (034), M = 1..4 with the
+windows as their own rows, one `matrix.py` pass per dtype on the kernels
+`_rocm_C` carries.  The tables below are the state before 034 (M = 1 and 4
+only); the configurations 034 did not re-tune reproduce them within 0.3 %.
 
 `matrix.py`, HND, all 52 configuration/M pairs, geomean over the seven
 contexts, measured 2026-09-26 at `2c7b87b6e8`, the VINLDS rows (031)
@@ -123,7 +128,7 @@ Four cells of 364 trail Triton by 1-2 %, D=128 M=1 at S=32768.
 
 ### Sliding window
 
-`matrix.py --windowed` (`golden/swa.md`), fp16; bf16 within 0.6 %.  Past
+`matrix.py --windowed` (before 034; now in `golden/fp16.md`), fp16; bf16 within 0.6 %.  Past
 S = window every context reads the same bytes, so the plateau is what a
 long conversation sees; `ceiling` is `floor.py --windowed` at those bytes.
 
@@ -197,13 +202,10 @@ floor alone is 65-85 % of roof depending on bytes (`floor.py`).
 
 ### 4.1 Keep the record current
 
-OPTIMIZATIONS 010-033 describe the state above, and `golden/` was measured on
-it: `d*.md` and `bf16.md` are the full matrix of the re-tune (021) with every
-row changed since re-measured (Triton included, both dtypes) and spliced in --
-the rows left untouched run byte-identical code.  One full `matrix.py` pass
-(fp16 and bf16, ~1.5 h) would make them a single photograph.  `swa.md` and
-`batch.md` are single passes, `batch.md` with the cells two rule fixes
-changed re-measured.  Cite commits by their full hash in golden/ and here:
+OPTIMIZATIONS 010-034 describe the state above.  `fp16.md` and `bf16.md` are
+single passes of `matrix.py --m 1 2 3 4` (and `--windowed`) with Triton, and
+`floor.py --m 1 2 3 4` for the ceilings, taken after 034; `batch.md` is older
+(033) and ran the single-sequence rows as they were then.  Cite commits by their full hash in golden/ and here:
 `typos` reads some short hashes as misspellings (one starting `9d`, then `aa5`, did).
 
 ### 4.2 Re-tune what is left
@@ -473,6 +475,12 @@ There is **no `.venv` in the worktree**; everything runs from the main tree's.
 | torch | 2.12.0+rocm10.1.0a20260803 |
 | compiled `.so` | `/scratch/rogarcia/vllm/vllm/*.so`, symlinked into the worktree |
 
+The backend runs only the variants built into `_rocm_C`
+(`csrc/rocm/rdna35_attn/variants.def`, 034): after changing a table,
+regenerate the list (`python -m vllm.v1.attention.backends.rdna35_hip_attn`)
+and rebuild `_rocm_C`.  The tools JIT-build instead (`shapeset.py` sets
+`VLLM_RDNA35_ATTN_JIT=1`).
+
 `PYTHONPATH=$PWD` makes `import vllm` resolve to the worktree. Scripts run as
 files need it; `python -m pytest` from the worktree root does not, because
 `-m` puts the working directory on the path. Verify:
@@ -525,7 +533,7 @@ amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/floor.py
 amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/batch.py
 amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/batch.py --windowed
 
-# the sliding-window configurations: matrix, tuning, ceiling (golden/swa.md)
+# the sliding-window configurations: matrix, tuning, ceiling (golden/fp16.md)
 amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/matrix.py --windowed
 amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/tune.py --windowed --hq 8 --hkv 1 --head-dim 256
 amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/floor.py --windowed

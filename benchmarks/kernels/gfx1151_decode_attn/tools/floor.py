@@ -153,6 +153,7 @@ def main() -> None:
         default=[32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 65536, 262144],
         help="stream sizes in KiB; they must bracket every configuration's KV",
     )
+    p.add_argument("--m", type=int, nargs="+", default=[1, 4])
     args = p.parse_args()
 
     mod = _module()
@@ -174,7 +175,7 @@ def main() -> None:
     print(f"\n| D | Hq | Hkv | {win}M | ceiling geomean | ceiling @128 |")
     print("| --- " * (6 + bool(win)) + "|")
     for d, hq, hkv, w in configs:
-        for m in (1, 4):
+        for m in args.m:
             r = []
             for s in CONTEXTS:
                 roof = shapeset.roofline_us(hq, hkv, d, m, s, window=w)
