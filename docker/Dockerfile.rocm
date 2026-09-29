@@ -66,6 +66,8 @@ ENV UV_INDEX_STRATEGY="unsafe-best-match"
 # Use copy mode to avoid hardlink failures with Docker cache mounts
 ENV UV_LINK_MODE=copy
 ENV UV_BREAK_SYSTEM_PACKAGES=1
+# uv pip install --system writes site-packages. Ubuntu Python imports dist-packages.
+RUN python3 -c 'import pathlib,sys; ver="%s.%s"%(sys.version_info.major,sys.version_info.minor); extra=["/usr/lib/python%s/site-packages"%ver,"/usr/local/lib/python%s/site-packages"%ver,"/usr/lib/python3/site-packages"]; anchors=[pathlib.Path(p) for p in sys.path if pathlib.Path(p).name=="dist-packages" and pathlib.Path(p).is_dir()]; assert anchors, sys.path; target=anchors[0]/"uv-system-site.pth"; target.write_text("\\n".join(extra)+"\\n"); print(target)'
 # ccache directory - persisted across layer rebuilds via cache mounts.
 ENV CCACHE_DIR=/root/.cache/ccache
 ENV CCACHE_COMPILERCHECK=content
