@@ -65,6 +65,7 @@ ENV UV_HTTP_TIMEOUT=500
 ENV UV_INDEX_STRATEGY="unsafe-best-match"
 # Use copy mode to avoid hardlink failures with Docker cache mounts
 ENV UV_LINK_MODE=copy
+ENV UV_BREAK_SYSTEM_PACKAGES=1
 # ccache directory - persisted across layer rebuilds via cache mounts.
 ENV CCACHE_DIR=/root/.cache/ccache
 ENV CCACHE_COMPILERCHECK=content
