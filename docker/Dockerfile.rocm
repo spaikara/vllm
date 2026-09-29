@@ -67,7 +67,91 @@ ENV UV_INDEX_STRATEGY="unsafe-best-match"
 ENV UV_LINK_MODE=copy
 ENV UV_BREAK_SYSTEM_PACKAGES=1
 # uv pip install --system writes site-packages. Ubuntu Python imports dist-packages.
-RUN python3 -c 'import pathlib,sys; ver="%s.%s"%(sys.version_info.major,sys.version_info.minor); extra=["/usr/lib/python%s/site-packages"%ver,"/usr/local/lib/python%s/site-packages"%ver,"/usr/lib/python3/site-packages"]; anchors=[pathlib.Path(p) for p in sys.path if pathlib.Path(p).name=="dist-packages" and pathlib.Path(p).is_dir()]; assert anchors, sys.path; target=anchors[0]/"uv-system-site.pth"; target.write_text(chr(10).join(extra)+chr(10))st-toolchain-input/vllm \
+RUN python3 -c 'import pathlib,sys; ver="%s.%s"%(sys.version_info.major,sys.version_info.minor); extra=["/usr/lib/python%s/site-packages"%ver,"/usr/local/lib/python%s/site-packages"%ver,"/usr/lib/python3/site-packages"]; anchors=[pathlib.Path(p) for p in sys.path if pathlib.Path(p).name=="dist-packages" and pathlib.Path(p).is_dir()]; assert anchors, sys.path; target=anchors[0]/"uv-system-site.pth"; target.write_text(chr(10).join(extra)+chr(10)); print(target)'
+# ccache directory - persisted across layer rebuilds via cache mounts.
+ENV CCACHE_DIR=/root/.cache/ccache
+ENV CCACHE_COMPILERCHECK=content
+# Empty by default so build steps fall back to $(nproc); CI can override.
+ARG max_jobs
+ENV MAX_JOBS=${max_jobs}
+
+# Install sccache if USE_SCCACHE is enabled (for release builds)
+ARG USE_SCCACHE
+ARG SCCACHE_DOWNLOAD_URL
+ARG SCCACHE_ENDPOINT
+ARG SCCACHE_BUCKET_NAME
+ARG SCCACHE_REGION_NAME
+ARG SCCACHE_S3_NO_CREDENTIALS
+RUN if [ "$USE_SCCACHE" = "1" ]; then \
+        if command -v sccache >/dev/null 2>&1; then \
+            echo "sccache already installed, skipping installation"; \
+            sccache --version; \
+        else \
+            echo "Installing sccache..." \
+            && SCCACHE_ARCH="x86_64" \
+            && SCCACHE_VERSION="v0.8.1" \
+            && SCCACHE_DL_URL="${SCCACHE_DOWNLOAD_URL:-https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl.tar.gz}" \
+            && curl -L -o /tmp/sccache.tar.gz ${SCCACHE_DL_URL} \
+            && tar -xzf /tmp/sccache.tar.gz -C /tmp \
+            && mv /tmp/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl/sccache /usr/bin/sccache \
+            && chmod +x /usr/bin/sccache \
+            && rm -rf /tmp/sccache.tar.gz /tmp/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl \
+            && sccache --version; \
+        fi; \
+    fi
+
+# Set sccache environment variables only when USE_SCCACHE=1
+# This prevents S3 config from leaking into images when sccache is not used
+ARG USE_SCCACHE
+ENV SCCACHE_BUCKET=${USE_SCCACHE:+${SCCACHE_BUCKET_NAME}}
+ENV SCCACHE_REGION=${USE_SCCACHE:+${SCCACHE_REGION_NAME}}
+ENV SCCACHE_S3_NO_CREDENTIALS=${USE_SCCACHE:+${SCCACHE_S3_NO_CREDENTIALS}}
+ENV SCCACHE_IDLE_TIMEOUT=${USE_SCCACHE:+0}
+
+ARG COMMON_WORKDIR
+WORKDIR ${COMMON_WORKDIR}
+
+
+# -----------------------
+# vLLM fetch stages
+FROM base AS fetch_vllm_0
+ONBUILD COPY ./ vllm/
+FROM base AS fetch_vllm_1
+ARG VLLM_REPO
+ARG VLLM_BRANCH
+ONBUILD RUN git clone ${VLLM_REPO} \
+	    && cd vllm \
+	    && git fetch -v --prune -- origin ${VLLM_BRANCH} \
+	    && git checkout FETCH_HEAD \
+        && if [ ${VLLM_REPO} != "https://github.com/vllm-project/vllm.git" ] ; then \
+               git remote add upstream "https://github.com/vllm-project/vllm.git" \
+               && git fetch upstream ; fi
+FROM fetch_vllm_${REMOTE_VLLM} AS fetch_vllm
+
+# Resolve the device-independent source version once for every downstream
+# artifact. setuptools-scm reads Git metadata for local/remote sources and the
+# archive metadata generated for canonical CI contexts.
+FROM fetch_vllm AS vllm-version
+ARG COMMON_WORKDIR
+RUN --mount=type=cache,id=vllm-rocm-uv,target=/root/.cache/uv \
+    cd ${COMMON_WORKDIR}/vllm \
+    && uv pip install --system -r requirements/build/rust.txt \
+    && python3 -c \
+        "from setuptools_scm import get_version; print(get_version())" \
+        > /vllm-version.txt
+
+# -----------------------
+# Rust toolchain inputs
+#
+# Keep these separate from Rust source inputs so Rust source-only changes do not
+# invalidate the long-lived ci_base image that carries the toolchain.
+FROM scratch AS rust_toolchain_input_0
+COPY rust-toolchain.toml /rust-toolchain-input/vllm/rust-toolchain.toml
+
+FROM base AS rust_toolchain_input_1
+ARG VLLM_REPO
+ARG VLLM_BRANCH
+RUN git clone --no-checkout --filter=blob:none ${VLLM_REPO} /rust-toolchain-input/vllm \
     && cd /rust-toolchain-input/vllm \
     && git fetch -v --prune -- origin ${VLLM_BRANCH} \
     && git sparse-checkout init --no-cone \
